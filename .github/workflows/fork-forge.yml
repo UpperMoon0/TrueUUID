@@ -1,0 +1,43 @@
+name: Fork Forge regression
+on:
+  push:
+    branches: ['codex/trueuuid-terminal-login']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  forge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Prove unchanged upstream fails the regressions
+        run: bash scripts/ci/check-rejected-login-regression.sh
+      - name: Build and test patched Forge and shared modules
+        run: ./gradlew -Ptrueuuid.onlyTarget=forge-1.20.1 :platform:forge-1.20.1:build :shared:protocol:test :shared:presentation:test --no-daemon
+      - name: Validate release metadata and reobfuscated JAR
+        run: ./scripts/ci/verify-release-jar.sh forge-1.20.1 release-assets
+      - name: Verify reproducible packaging
+        run: |
+          cp platform/forge/1.20.1/build/libs/trueuuid-1.3.1-forge-1.20.1.jar /tmp/first.jar
+          ./gradlew -Ptrueuuid.onlyTarget=forge-1.20.1 :platform:forge-1.20.1:jar :platform:forge-1.20.1:reobfJar --rerun-tasks --no-daemon
+          cmp /tmp/first.jar platform/forge/1.20.1/build/libs/trueuuid-1.3.1-forge-1.20.1.jar
+          sha256sum /tmp/first.jar
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0ac95
+        if: always()
+        with:
+          name: forge-1.20.1-regression-evidence
+          path: |
+            release-assets/
+            regression-results/
+            **/build/test-results/test/*.xml
+          retention-days: 14
