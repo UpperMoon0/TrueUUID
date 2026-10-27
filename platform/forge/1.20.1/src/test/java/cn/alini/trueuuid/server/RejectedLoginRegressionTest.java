@@ -33,6 +33,8 @@ class RejectedLoginRegressionTest {
     private final GameProfile premium = new GameProfile(UUID.fromString("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"), "RegressionPlayer");
     private GameProfile profile = offline;
     private ServerLoginController controller;
+    private ServerLoginController.Access access;
+    private MigrationTransaction transaction;
     private int disconnects;
     private MockedStatic<TrueuuidConfig> config;
     private MockedStatic<Trueuuid> logging;
@@ -55,21 +57,22 @@ class RejectedLoginRegressionTest {
         TrueuuidRuntime.AUTH_STATE = mock(AuthState.class);
         TrueuuidRuntime.MIGRATION_LOCKS = new MigrationLockRegistry();
         TrueuuidRuntime.MIGRATIONS = mock(MigrationCoordinator.class);
-        MigrationTransaction tx = mock(MigrationTransaction.class);
-        when(TrueuuidRuntime.MIGRATIONS.forServer(server)).thenReturn(tx);
-        when(tx.find(anyString())).thenReturn(CompletableFuture.completedFuture(Optional.empty()));
-        when(tx.migrate(anyString(), any())).thenReturn(migration);
+        transaction = mock(MigrationTransaction.class);
+        when(TrueuuidRuntime.MIGRATIONS.forServer(server)).thenReturn(transaction);
+        when(transaction.find(anyString())).thenReturn(CompletableFuture.completedFuture(Optional.empty()));
+        when(transaction.migrate(anyString(), any())).thenReturn(migration);
         sessions.when(() -> SessionCheck.hasJoinedAsync(anyString(), anyString(), anyString(), anyString()))
                 .thenReturn(verification);
         sessions.when(() -> SessionCheck.publicClientIpOrEmpty(any())).thenReturn("");
         profiles.when(() -> VerifiedProfileService.create(any())).thenReturn(premium);
-        controller = new ServerLoginController(new ServerLoginController.Access() {
+        access = new ServerLoginController.Access() {
             public GameProfile profile() { return profile; }
             public void profile(GameProfile p) { profile = p; }
             public MinecraftServer server() { return server; }
             public Connection connection() { return connection; }
             public void disconnect(Component reason) { disconnects++; controller.onDisconnect(); }
-        });
+        };
+        controller = new ServerLoginController(access);
         failures.when(() -> LoginFailureService.handle(any(), any(), any(), anyString(), anyBoolean(), any()))
                 .thenAnswer(i -> {
                     ((Consumer<Component>) i.getArgument(5)).accept(mock(Component.class));
@@ -99,6 +102,14 @@ class RejectedLoginRegressionTest {
         drain();
         assertNeverAccepted();
         sessions.verifyNoInteractions();
+    }
+
+    @Test void cleanupWithoutAnAuthenticationDecisionCannotGrantAcceptance() throws Exception {
+        var reset = ServerLoginController.class.getDeclaredMethod("reset");
+        reset.setAccessible(true);
+        reset.invoke(controller);
+        assertTrue(ready().isCancelled(), "generic cleanup must not grant admission");
+        assertSame(offline, profile);
     }
 
     @Test void transportClosureWithoutListenerCallbackIsTerminal() {
@@ -205,6 +216,25 @@ class RejectedLoginRegressionTest {
         assertFalse(TrueuuidRuntime.MIGRATION_LOCKS.contains(premium.getName()));
     }
 
+    @Test void newConnectionCanRetryOnlyAfterDisconnectedMigrationWorkerFinishes() throws Exception {
+        offerMigration();
+        answer(true, true); drain();
+        controller.onDisconnect();
+        var blockedRetry = new ServerLoginController(access);
+        blockedRetry.afterProfileInitialized();
+        var blocked = callback(); blockedRetry.onReadyToAccept(blocked);
+        assertTrue(blocked.isCancelled());
+        assertTrue(TrueuuidRuntime.MIGRATION_LOCKS.contains(premium.getName()));
+        migration.complete(null); drain();
+        when(transaction.find(anyString())).thenReturn(CompletableFuture.completedFuture(Optional.empty()));
+        controller = new ServerLoginController(access);
+        controller.afterProfileInitialized();
+        assertTrue(ready().isCancelled());
+        answer(true, false); drain();
+        assertSame(premium, profile);
+        assertFalse(ready().isCancelled());
+    }
+
     @Test void nettyAnswerIsProcessedOnServerThreadAndCannotOvertakeDisconnect() throws Exception {
         when(server.isSameThread()).thenReturn(false);
         answer(false, false);
@@ -215,14 +245,11 @@ class RejectedLoginRegressionTest {
     }
 
     private void offerMigration() throws Exception {
-        // Use the production transition after verification without contacting an authentication service.
-        var method = ServerLoginController.class.getDeclaredMethod("trueuuid$requestOfflineUpgradeConfirmation",
-                PlayerDataMigration.OfflineData.class, GameProfile.class, AuthState.AuthSource.class, String.class, String.class);
-        method.setAccessible(true);
-        // loginState.beginMigration requires a verified answer first.
+        when(transaction.find(anyString())).thenReturn(CompletableFuture.completedFuture(Optional.of(
+                new MigrationTransaction.Offer(offline.getId(), "playerdata"))));
         answer(true, false); drain();
-        method.invoke(controller, new PlayerDataMigration.OfflineData(offline.getId(), "playerdata"), premium,
-                AuthState.AuthSource.MOJANG, "Mojang", "");
+        verification.complete(Optional.of(new VerifiedProfile(premium.getId(), premium.getName(), List.of())));
+        drain();
     }
 
     private void answer(boolean joined, boolean confirmed) throws Exception {

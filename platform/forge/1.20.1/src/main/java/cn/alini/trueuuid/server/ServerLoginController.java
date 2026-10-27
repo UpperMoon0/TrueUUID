@@ -107,7 +107,7 @@ public final class ServerLoginController {
         if (!this.trueuuid$queryPending) {
             // Forge re-enters READY_TO_ACCEPT on every server tick.  Keep the
             // final accept call blocked while a TrueUUID query is outstanding;
-            // the async verifier releases it by reset() on success/fallback.
+            // Only an explicit verifier or policy-approved fallback releases it.
             if (this.trueuuid$txId != 0) ci.cancel();
             // Fail closed if a loader/lifecycle edge reaches READY_TO_ACCEPT
             // without our hello hook having scheduled the required query.
@@ -421,7 +421,14 @@ public final class ServerLoginController {
     private void handleAuthFailure(String ip, String why, boolean explicitOfflineClient) {
         GameProfile fallback = LoginFailureService.handle(access.profile(), access.connection(), ip, why,
                 explicitOfflineClient, this::sendDisconnectWithReason);
-        if (!trueuuid$closed) access.profile(fallback);
+        if (!trueuuid$closed) {
+            if (fallback == null || fallback.getName() == null || fallback.getName().isBlank()) {
+                sendDisconnectWithReason(Component.translatable("trueuuid.disconnect.auth_denied"));
+                return;
+            }
+            access.profile(fallback);
+            this.trueuuid$authFinalized = true;
+        }
     }
 
     private void sendDisconnectWithReason(Component reason) {
@@ -488,6 +495,7 @@ public final class ServerLoginController {
         UUID verifiedUuid = verifiedProfile.getId();
         access.profile(verifiedProfile);
         VerifiedProfileService.record(access.connection(), verifiedProfile, ip, source, displayName);
+        this.trueuuid$authFinalized = true;
         Trueuuid.acceptance("result=premium_ready player={} uuid={} source={}", name, verifiedUuid, source);
         if (TrueuuidConfig.debug()) {
             System.out.println("[TrueUUID] 记录认证成功来源: " + source + ", displayName=" + displayName);
@@ -548,7 +556,8 @@ public final class ServerLoginController {
         this.trueuuid$nonce = null;
         this.trueuuid$sentAt = 0L;
         this.trueuuid$queryPending = false;
-        this.trueuuid$authFinalized = !this.trueuuid$closed;
+        // Resource cleanup is not an authentication decision. Keep the gate
+        // closed unless verification or an explicitly permitted fallback set it.
         this.trueuuid$offlineUpgradeOffered = false;
         this.trueuuid$migrationConfirmation = false;
         this.trueuuid$pendingVerifiedProfile = null;
