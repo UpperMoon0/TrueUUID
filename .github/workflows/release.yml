@@ -24,7 +24,8 @@ concurrency:
 jobs:
   guard-accidental-publish:
     name: Return manually published release to draft
-    if: github.event_name == 'release'
+    # The owner fork has a separate explicitly Forge-only publication path.
+    if: github.event_name == 'release' && github.repository == 'YuWan-030/TrueUUID'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -65,7 +66,7 @@ jobs:
 
   metadata:
     name: Validate draft release
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'YuWan-030/TrueUUID'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     # Draft releases are deliberately omitted from the releases API for
