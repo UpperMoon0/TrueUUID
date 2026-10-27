@@ -48,7 +48,7 @@ def main():
         print('Verified canonical Forge-only JAR identity')
         return
     repo, tag = manifest['repository'], manifest['tag']
-    assert output('gh', 'repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner') == repo
+    assert output('gh', 'repo', 'view', repo, '--json', 'nameWithOwner', '--jq', '.nameWithOwner') == repo
     head = output('git', 'rev-parse', 'HEAD')
     assert api(f'repos/{repo}/git/ref/heads/main')['object']['sha'] == head, 'publish only merged main'
     # Changes to the publication helper must not silently change tested JAR inputs.
