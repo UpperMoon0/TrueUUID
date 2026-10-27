@@ -224,6 +224,14 @@ tasks.named('jar', Jar).configure {
     }
 
     from { project(':shared:protocol').sourceSets.main.output }
+    from(rootProject.file('LICENSE')) {
+        into 'META-INF'
+        rename { 'LICENSE-TrueUUID' }
+    }
+    from(rootProject.file('docs/development/nstut-1.3.1.md')) {
+        into 'META-INF'
+        rename { 'TrueUUID-fork-notice.md' }
+    }
 }
 
 // MixinGradle writes these outside JavaCompile's normal classes directory but
