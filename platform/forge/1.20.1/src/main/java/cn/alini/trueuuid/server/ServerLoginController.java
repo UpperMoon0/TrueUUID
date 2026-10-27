@@ -48,6 +48,9 @@ public final class ServerLoginController {
     private volatile boolean trueuuid$queryPending = false;
     /** True only after this offline login has reached a final auth decision. */
     private volatile boolean trueuuid$authFinalized = false;
+    // Terminal even while the asynchronous transport close is still pending.
+    private volatile boolean trueuuid$closed;
+    private boolean trueuuid$migrationRunning;
     private boolean trueuuid$offlineUpgradeOffered = false;
     private boolean trueuuid$migrationConfirmation = false;
     private GameProfile trueuuid$pendingVerifiedProfile = null;
@@ -65,7 +68,8 @@ public final class ServerLoginController {
      * Installs the TrueUUID gate after vanilla initializes the login profile
      * but before Forge exposes its NEGOTIATING state to the server tick.
      */
-    public void afterProfileInitialized() {
+    public synchronized void afterProfileInitialized() {
+        if (trueuuid$closed) return;
         if (access.server().usesAuthentication()) {
             debug("skipping TrueUUID query because the server is in online mode");
             return;
@@ -94,11 +98,16 @@ public final class ServerLoginController {
      * this point Forge's LOGIN negotiation is complete, so a separate custom
      * query cannot be mistaken for an FML indexed reply.
      */
-    public void onReadyToAccept(CallbackInfo ci) {
+    public synchronized void onReadyToAccept(CallbackInfo ci) {
+        if (trueuuid$closed || !access.connection().isConnected()) {
+            onDisconnect();
+            ci.cancel();
+            return;
+        }
         if (!this.trueuuid$queryPending) {
             // Forge re-enters READY_TO_ACCEPT on every server tick.  Keep the
             // final accept call blocked while a TrueUUID query is outstanding;
-            // the async verifier releases it by reset() on success/fallback.
+            // Only an explicit verifier or policy-approved fallback releases it.
             if (this.trueuuid$txId != 0) ci.cancel();
             // Fail closed if a loader/lifecycle edge reaches READY_TO_ACCEPT
             // without our hello hook having scheduled the required query.
@@ -134,13 +143,13 @@ public final class ServerLoginController {
         ci.cancel();
     }
 
-    public void onTick(CallbackInfo ci) {
-        if (this.trueuuid$txId == 0 || this.trueuuid$sentAt == 0L) return;
-        if (!access.connection().isConnected()) {
-            TrueuuidRuntime.AUTH_STATE.remove(access.connection());
-            reset();
+    public synchronized void onTick(CallbackInfo ci) {
+        if (trueuuid$closed || !access.connection().isConnected()) {
+            onDisconnect();
+            ci.cancel();
             return;
         }
+        if (this.trueuuid$txId == 0 || this.trueuuid$sentAt == 0L) return;
         long timeoutMs = this.trueuuid$offlineUpgradeOffered ? Math.max(TrueuuidConfig.timeoutMs(), 180_000L) : TrueuuidConfig.timeoutMs();
         if (timeoutMs <= 0) {
             // TrueUUID 自定义认证还没有结束时暂停原版登录推进，避免离线档案先进入世界后又被正版档案二次接受。
@@ -163,6 +172,7 @@ public final class ServerLoginController {
             Trueuuid.acceptance("result=migration_timeout player={}", access.profile() == null ? "<unknown>" : access.profile().getName());
             sendDisconnectWithReason(Component.translatable("trueuuid.disconnect.migration_confirm_timeout"));
             reset();
+            ci.cancel();
         } else {
             sendDisconnectWithReason(TrueuuidText.configComponent(
                     TrueuuidConfig.timeoutKickMessage(),
@@ -174,11 +184,29 @@ public final class ServerLoginController {
     }
 
     public void onLoginCustom(ServerboundCustomQueryPacket packet, CallbackInfo ci) {
+        if (trueuuid$closed) { ci.cancel(); return; }
         if (this.trueuuid$txId == 0) return;
         if (packet.getTransactionId() != this.trueuuid$txId) {
             debug("ignoring login query response for transaction " + packet.getTransactionId());
             return;
         }
+        // Decode while Netty owns the buffer. Only immutable values cross to
+        // the server thread, where vanilla performs login acceptance.
+        AuthMessages.Answer decoded = null;
+        try { decoded = LoginPacketCodec.decode(packet.getData()); }
+        catch (Throwable malformed) { /* Process failure on the server thread. */ }
+        AuthMessages.Answer answer = decoded;
+        int transactionId = packet.getTransactionId();
+        ci.cancel();
+        Runnable handle = () -> onLoginAnswer(transactionId, answer);
+        if (access.server().isSameThread()) handle.run();
+        else access.server().execute(handle);
+    }
+
+    private synchronized void onLoginAnswer(int transactionId, AuthMessages.Answer answer) {
+        if (trueuuid$closed || !access.connection().isConnected() || this.trueuuid$txId == 0
+                || transactionId != this.trueuuid$txId) return;
+        CallbackInfo ci = new CallbackInfo("trueuuidAnswer", true);
         debug("received authentication response for " + access.profile().getName());
         Trueuuid.acceptance("phase=auth_answer_received player={} migrationPhase={}",
                 access.profile().getName(), this.trueuuid$migrationConfirmation);
@@ -193,15 +221,12 @@ public final class ServerLoginController {
             System.out.println("[TrueUUID] 收到客户端认证包, 玩家: " + (access.profile() != null ? access.profile().getName() : "<unknown>") + ", ip: " + ip);
         }
 
-        AuthMessages.Answer answer;
-        try {
-            answer = LoginPacketCodec.decode(packet.getData());
-        } catch (Throwable malformed) {
-            debug("received malformed TrueUUID answer: " + malformed.getClass().getName());
-            handleAuthFailure(ip, "缺少数据");
-            reset(); ci.cancel(); return;
+        if (answer == null) {
+            handleAuthFailure(ip, "malformed answer");
+            reset();
+            return;
         }
-        LoginStateMachine.AnswerResult stateResult = loginState.acceptAnswer(packet.getTransactionId(), answer);
+        LoginStateMachine.AnswerResult stateResult = loginState.acceptAnswer(transactionId, answer);
         if (stateResult == LoginStateMachine.AnswerResult.IGNORE) {
             ci.cancel();
             return;
@@ -245,10 +270,17 @@ public final class ServerLoginController {
                         migrationName, this.trueuuid$pendingVerifiedProfile.getId());
                 trueuuid$markMigrationPending(migrationName);
                 int activeTx = this.trueuuid$txId;
-                this.trueuuid$currentWork = TrueuuidRuntime.MIGRATIONS.forServer(access.server()).migrate(
-                        migrationName, this.trueuuid$pendingVerifiedProfile.getId())
-                        .whenComplete((ignored, failure) -> access.server().execute(() -> {
-                            if (this.trueuuid$txId != activeTx) return;
+                CompletableFuture<Void> migration = TrueuuidRuntime.MIGRATIONS.forServer(access.server()).migrate(
+                        migrationName, this.trueuuid$pendingVerifiedProfile.getId());
+                this.trueuuid$migrationRunning = true;
+                this.trueuuid$currentWork = migration;
+                migration.whenComplete((ignored, failure) -> {
+                    // Release even if the listener closed before this worker finished.
+                    trueuuid$clearMigrationPending(migrationName);
+                    access.server().execute(() -> {
+                          synchronized (ServerLoginController.this) {
+                            this.trueuuid$migrationRunning = false;
+                            if (trueuuid$closed || !access.connection().isConnected() || this.trueuuid$txId != activeTx) return;
                             try {
                                 if (failure != null) {
                                     Trueuuid.acceptance("result=migration_failed player={}", migrationName);
@@ -263,10 +295,11 @@ public final class ServerLoginController {
                                             migrationName, this.trueuuid$pendingVerifiedProfile.getId());
                                 }
                             } finally {
-                                trueuuid$clearMigrationPending(migrationName);
                                 reset();
                             }
-                        }));
+                          }
+                        });
+                });
             } catch (Throwable failure) {
                 handleAuthFailure(ip, "服务器异常", false);
                 reset();
@@ -310,7 +343,8 @@ public final class ServerLoginController {
                     }).whenComplete((lookup, throwable) -> {
                         // 始终在主线程处理后续逻辑 (Always process subsequent logic on main thread)
                         access.server().execute(() -> {
-                            if (this.trueuuid$txId != activeTx) return;
+                          synchronized (ServerLoginController.this) {
+                            if (trueuuid$closed || !access.connection().isConnected() || this.trueuuid$txId != activeTx) return;
                             try {
                                 if (throwable != null) {
                                     if (TrueuuidConfig.debug()) {
@@ -354,6 +388,7 @@ public final class ServerLoginController {
                                     reset();
                                 }
                             }
+                          }
                         });
                     });
 
@@ -369,9 +404,11 @@ public final class ServerLoginController {
         }
     }
 
-    public void onDisconnect() {
+    public synchronized void onDisconnect() {
+        this.trueuuid$closed = true;
+        this.trueuuid$authFinalized = false;
         TrueuuidRuntime.AUTH_STATE.remove(access.connection());
-        if (this.trueuuid$pendingVerifiedProfile != null) {
+        if (this.trueuuid$pendingVerifiedProfile != null && !this.trueuuid$migrationRunning) {
             trueuuid$clearMigrationPending(this.trueuuid$pendingVerifiedProfile.getName());
         }
         reset();
@@ -382,12 +419,22 @@ public final class ServerLoginController {
     }
 
     private void handleAuthFailure(String ip, String why, boolean explicitOfflineClient) {
-        access.profile(LoginFailureService.handle(access.profile(), access.connection(), ip, why,
-                explicitOfflineClient, this::sendDisconnectWithReason));
+        GameProfile fallback = LoginFailureService.handle(access.profile(), access.connection(), ip, why,
+                explicitOfflineClient, this::sendDisconnectWithReason);
+        if (!trueuuid$closed) {
+            if (fallback == null || fallback.getName() == null || fallback.getName().isBlank()) {
+                sendDisconnectWithReason(Component.translatable("trueuuid.disconnect.auth_denied"));
+                return;
+            }
+            access.profile(fallback);
+            this.trueuuid$authFinalized = true;
+        }
     }
 
     private void sendDisconnectWithReason(Component reason) {
         // 登录监听器只能使用 LOGIN 阶段的断开流程，避免混发 PLAY 断开包导致客户端按错误协议解码。
+        // Seal the gate before vanilla disconnect or any reentrant callback.
+        onDisconnect();
         access.disconnect(reason);
     }
 
@@ -448,6 +495,7 @@ public final class ServerLoginController {
         UUID verifiedUuid = verifiedProfile.getId();
         access.profile(verifiedProfile);
         VerifiedProfileService.record(access.connection(), verifiedProfile, ip, source, displayName);
+        this.trueuuid$authFinalized = true;
         Trueuuid.acceptance("result=premium_ready player={} uuid={} source={}", name, verifiedUuid, source);
         if (TrueuuidConfig.debug()) {
             System.out.println("[TrueUUID] 记录认证成功来源: " + source + ", displayName=" + displayName);
@@ -508,7 +556,8 @@ public final class ServerLoginController {
         this.trueuuid$nonce = null;
         this.trueuuid$sentAt = 0L;
         this.trueuuid$queryPending = false;
-        this.trueuuid$authFinalized = true;
+        // Resource cleanup is not an authentication decision. Keep the gate
+        // closed unless verification or an explicitly permitted fallback set it.
         this.trueuuid$offlineUpgradeOffered = false;
         this.trueuuid$migrationConfirmation = false;
         this.trueuuid$pendingVerifiedProfile = null;
@@ -518,7 +567,8 @@ public final class ServerLoginController {
         this.trueuuid$pendingOfflineData = null;
         CompletableFuture<?> work = this.trueuuid$currentWork;
         this.trueuuid$currentWork = null;
-        if (work != null && !work.isDone()) work.cancel(true);
+        // Future cancellation does not stop a running migration's file IO.
+        if (!trueuuid$migrationRunning && work != null && !work.isDone()) work.cancel(true);
         this.loginState.reset();
     }
 
