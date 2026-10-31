@@ -27,6 +27,13 @@ def validate(manifest, release, targets):
     return asset
 
 
+
+def validate_immutable_baseline(manifest, tagged):
+    """The published 1.3.1 identity is read-only, independent of current builds."""
+    assert manifest['version'] == '1.3.1', 'historical manifest must remain at 1.3.1'
+    assert manifest == tagged, 'published 1.3.1 release manifest differs from its immutable tag'
+
+
 def output(*args):
     return subprocess.check_output(args, cwd=ROOT, text=True).strip()
 
@@ -39,9 +46,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--publish', action='store_true')
     parser.add_argument('--check-jar', type=Path)
+    parser.add_argument('--check-baseline', action='store_true')
     args = parser.parse_args()
     manifest = json.loads((ROOT / 'release/forge-fork.json').read_text())
     targets = json.loads((ROOT / 'release/targets.json').read_text())
+    if args.check_baseline:
+        assert not args.publish and not args.check_jar, 'baseline validation is read-only'
+        tagged = json.loads(output('git', 'show', f"{manifest['tag']}:release/forge-fork.json"))
+        validate_immutable_baseline(manifest, tagged)
+        print('Verified immutable published 1.3.1 baseline; current candidate JAR is independent')
+        return
     if args.check_jar:
         data = args.check_jar.read_bytes()
         assert len(data) == manifest['size'] and hashlib.sha256(data).hexdigest() == manifest['sha256']
