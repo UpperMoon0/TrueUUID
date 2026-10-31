@@ -16,6 +16,23 @@ class ForgePublicationGuards(unittest.TestCase):
         self.release = {'tag_name': 'v1.3.1', 'assets': [{'name': self.manifest['fileName'],
             'size': self.manifest['size'], 'digest': 'sha256:' + self.manifest['sha256'], 'state': 'uploaded'}]}
 
+    def test_immutable_published_baseline(self):
+        tagged = json.loads(publisher.output('git', 'show',
+            f"{self.manifest['tag']}:release/forge-fork.json"))
+        publisher.validate_immutable_baseline(self.manifest, tagged)
+
+    def test_immutable_baseline_rejects_changed_digest(self):
+        tagged = copy.deepcopy(self.manifest)
+        self.manifest['sha256'] = '0' * 64
+        with self.assertRaises(AssertionError):
+            publisher.validate_immutable_baseline(self.manifest, tagged)
+
+    def test_immutable_baseline_rejects_relabelled_version(self):
+        tagged = copy.deepcopy(self.manifest)
+        self.manifest['version'] = '1.3.2'
+        with self.assertRaises(AssertionError):
+            publisher.validate_immutable_baseline(self.manifest, tagged)
+
     def rejected(self):
         with self.assertRaises(AssertionError):
             publisher.validate(self.manifest, self.release, self.targets)
