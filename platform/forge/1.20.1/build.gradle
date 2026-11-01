@@ -228,7 +228,7 @@ tasks.named('jar', Jar).configure {
         into 'META-INF'
         rename { 'LICENSE-TrueUUID' }
     }
-    from(rootProject.file('docs/development/nstut-1.3.1.md')) {
+    from(rootProject.file('docs/development/nstut-1.3.2.md')) {
         into 'META-INF'
         rename { 'TrueUUID-fork-notice.md' }
     }

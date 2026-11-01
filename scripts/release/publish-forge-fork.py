@@ -9,6 +9,9 @@ import tempfile
 from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[2]
+# Independently pinned release reference: never select a baseline from editable manifest data.
+PUBLISHED_FORGE_TAG = 'v1.3.1'
+PUBLISHED_FORGE_TAG_COMMIT = 'de2a916666769f55b7e18c0d1bfbfa2c85a5b280'
 
 
 def validate(manifest, release, targets):
@@ -27,6 +30,22 @@ def validate(manifest, release, targets):
     return asset
 
 
+
+def validate_immutable_baseline(manifest, tagged):
+    """The published 1.3.1 identity is read-only, independent of current builds."""
+    assert manifest['version'] == '1.3.1', 'historical manifest must remain at 1.3.1'
+    assert manifest['tag'] == PUBLISHED_FORGE_TAG, 'historical manifest tag was retargeted'
+    assert manifest == tagged, 'published 1.3.1 release manifest differs from its immutable tag'
+
+
+def check_immutable_baseline(manifest):
+    """Verify the historical ref itself and compare against its fixed tagged manifest."""
+    tag_commit = output('git', 'rev-parse', f'refs/tags/{PUBLISHED_FORGE_TAG}^{{commit}}')
+    assert tag_commit == PUBLISHED_FORGE_TAG_COMMIT, 'published 1.3.1 tag was moved'
+    tagged = json.loads(output('git', 'show', f'{PUBLISHED_FORGE_TAG}:release/forge-fork.json'))
+    validate_immutable_baseline(manifest, tagged)
+
+
 def output(*args):
     return subprocess.check_output(args, cwd=ROOT, text=True).strip()
 
@@ -39,9 +58,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--publish', action='store_true')
     parser.add_argument('--check-jar', type=Path)
+    parser.add_argument('--check-baseline', action='store_true')
     args = parser.parse_args()
     manifest = json.loads((ROOT / 'release/forge-fork.json').read_text())
     targets = json.loads((ROOT / 'release/targets.json').read_text())
+    if args.check_baseline:
+        assert not args.publish and not args.check_jar, 'baseline validation is read-only'
+        check_immutable_baseline(manifest)
+        print('Verified immutable published 1.3.1 baseline; current candidate JAR is independent')
+        return
     if args.check_jar:
         data = args.check_jar.read_bytes()
         assert len(data) == manifest['size'] and hashlib.sha256(data).hexdigest() == manifest['sha256']
